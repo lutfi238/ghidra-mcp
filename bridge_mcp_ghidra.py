@@ -32,6 +32,7 @@ from urllib.parse import urlencode, urlparse
 
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.lowlevel.server import NotificationOptions
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ==========================================================================
 # Configuration
@@ -174,10 +175,33 @@ SEGMENT_ADDR_WITH_0X_PATTERN = re.compile(
     r"^([a-zA-Z_][a-zA-Z0-9_]*):0[xX]([0-9a-fA-F]+)$"
 )
 FUNCTION_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+MAX_TOOL_NAME_LENGTH = 64
+INVALID_TOOL_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_-]+")
+REPEATED_UNDERSCORES = re.compile(r"_+")
 
 
 def is_pid_alive(pid: int) -> bool:
     """Check if a process with the given PID is still running."""
+    if pid <= 0:
+        return False
+
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        # PROCESS_QUERY_LIMITED_INFORMATION is enough for a liveness probe and
+        # avoids the POSIX-only os.kill(pid, 0) behavior that can hang on Windows.
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+
+        error = kernel32.GetLastError()
+        if error == 5:  # ERROR_ACCESS_DENIED: alive but not queryable.
+            return True
+        return False
+
     try:
         os.kill(pid, 0)
         return True
@@ -185,6 +209,12 @@ def is_pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True  # Running but owned by another user
+    except OSError as e:
+        # Windows may raise WinError 87 ("The parameter is incorrect")
+        # for clearly invalid PIDs instead of ProcessLookupError.
+        if getattr(e, "winerror", None) == 87:
+            return False
+        raise
 
 
 def validate_server_url(url: str) -> bool:
@@ -205,6 +235,48 @@ def validate_hex_address(address: str) -> bool:
     if SEGMENT_ADDRESS_PATTERN.match(address):
         return True
     return bool(HEX_ADDRESS_PATTERN.match(address))
+
+
+def sanitize_tool_name(name: str) -> str:
+    """Normalize an MCP tool name for clients with strict CAPI validation."""
+    sanitized = INVALID_TOOL_NAME_CHARS.sub("_", name.lower())
+    sanitized = REPEATED_UNDERSCORES.sub("_", sanitized).strip("_")
+    if not sanitized:
+        raise ValueError(f"Tool name {name!r} is empty after sanitization")
+    if len(sanitized) > MAX_TOOL_NAME_LENGTH:
+        sanitized = sanitized[:MAX_TOOL_NAME_LENGTH].rstrip("_")
+    if not sanitized:
+        raise ValueError(f"Tool name {name!r} is empty after truncation")
+    if not TOOL_NAME_PATTERN.match(sanitized):
+        raise ValueError(f"Sanitized tool name {sanitized!r} is still invalid")
+    return sanitized
+
+
+def _allocate_tool_name(base_name: str, used_names: set[str]) -> str:
+    """Return a unique MCP tool name, adding a deterministic suffix on collision."""
+    if base_name not in used_names:
+        used_names.add(base_name)
+        return base_name
+
+    suffix = 2
+    while True:
+        suffix_text = f"_{suffix}"
+        trimmed_base = base_name[: MAX_TOOL_NAME_LENGTH - len(suffix_text)].rstrip("_")
+        if not trimmed_base:
+            raise ValueError(f"Tool name {base_name!r} is too short to suffix safely")
+        candidate = f"{trimmed_base}{suffix_text}"
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+        suffix += 1
+
+
+def validate_tool_name(name: str) -> None:
+    """Fail fast if an exposed MCP tool name is not CAPI-safe."""
+    if not TOOL_NAME_PATTERN.match(name) or len(name) > MAX_TOOL_NAME_LENGTH:
+        raise ValueError(
+            f"Invalid MCP tool name {name!r}; expected {TOOL_NAME_PATTERN.pattern} and length <= {MAX_TOOL_NAME_LENGTH}"
+        )
 
 
 def uds_request(
@@ -301,9 +373,13 @@ def do_request(
     """
     with _ghidra_lock:
         if _transport_mode == "uds" and _active_socket:
-            return uds_request(_active_socket, method, endpoint, params, json_data, timeout)
+            return uds_request(
+                _active_socket, method, endpoint, params, json_data, timeout
+            )
         elif _transport_mode == "tcp" and _active_tcp:
-            return tcp_request(_active_tcp, method, endpoint, params, json_data, timeout)
+            return tcp_request(
+                _active_tcp, method, endpoint, params, json_data, timeout
+            )
         else:
             raise ConnectionError(
                 "No Ghidra instance connected. Use connect_instance() first."
@@ -426,6 +502,37 @@ def get_timeout(endpoint: str, payload: dict | None = None) -> int:
     return base
 
 
+def _coerce_comment_entries(value):
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped: return []
+        try:
+            return _coerce_comment_entries(json.loads(stripped))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return value
+    items = value if isinstance(value, list) else [value] if isinstance(value, dict) and "address" in value else None
+    if items is not None:
+        return [
+            {"address": str(item["address"]), "comment": str(item["comment"])}
+            for item in items
+            if isinstance(item, dict) and item.get("address") is not None and item.get("comment") is not None
+        ]
+    if isinstance(value, dict):
+        return [
+            {"address": str(address), "comment": str(comment.get("comment") if isinstance(comment, dict) else comment)}
+            for address, comment in value.items()
+            if (comment.get("comment") if isinstance(comment, dict) else comment) is not None
+        ]
+    return value
+
+
+def _normalize_post_payload(endpoint: str, data: dict) -> dict:
+    if endpoint.strip("/").split("/")[-1] == "batch_set_comments":
+        data = dict(data)
+        for key in ("decompiler_comments", "disassembly_comments"):
+            data[key] = _coerce_comment_entries(data.get(key, []))
+    return data
+
 def _try_reconnect() -> bool:
     """Try to reconnect to the previously connected project after Ghidra restarts.
 
@@ -547,16 +654,21 @@ def dispatch_get(endpoint: str, params: dict | None = None, retries: int = 3) ->
     return json.dumps({"error": "Max retries exceeded"})
 
 
-def dispatch_post(endpoint: str, data: dict, retries: int = 3, query_params: dict | None = None) -> str:
+def dispatch_post(
+    endpoint: str, data: dict, retries: int = 3, query_params: dict | None = None
+) -> str:
     """POST JSON request via active transport. Returns raw response text."""
     err = _ensure_connected()
     if err:
         return json.dumps({"error": err})
 
+    data = _normalize_post_payload(endpoint, data)
     timeout = get_timeout(endpoint, data)
     for attempt in range(retries):
         try:
-            text, status = do_request("POST", endpoint, params=query_params, json_data=data, timeout=timeout)
+            text, status = do_request(
+                "POST", endpoint, params=query_params, json_data=data, timeout=timeout
+            )
             if status == 200:
                 return text.strip()
             if status >= 500 and attempt < retries - 1:
@@ -598,6 +710,36 @@ _TYPE_MAP = {
 }
 
 
+def _normalize_tool_def_names(schema: list[dict]) -> list[dict]:
+    """Normalize and de-duplicate MCP-visible names while keeping HTTP endpoints intact."""
+    normalized_schema: list[dict] = []
+    used_names = set(STATIC_TOOL_NAMES)
+
+    for tool_def in schema:
+        raw_name = (
+            tool_def.get("original_name")
+            or tool_def.get("name")
+            or tool_def["endpoint"].lstrip("/")
+        )
+        sanitized_name = sanitize_tool_name(raw_name)
+
+        # Preserve the existing behavior for valid dynamic names that exactly
+        # overlap a static bridge tool: _register_tool_def will skip them.
+        if sanitized_name in STATIC_TOOL_NAMES and sanitized_name == raw_name:
+            name = sanitized_name
+        else:
+            name = _allocate_tool_name(sanitized_name, used_names)
+
+        normalized = dict(tool_def)
+        normalized["name"] = name
+        normalized["original_name"] = raw_name
+        normalized["sanitized_name"] = sanitized_name
+        normalized["name_collided"] = name != sanitized_name
+        normalized_schema.append(normalized)
+
+    return normalized_schema
+
+
 def _parse_schema(raw: dict) -> list[dict]:
     """Convert upstream AnnotationScanner schema to internal tool defs.
 
@@ -607,7 +749,7 @@ def _parse_schema(raw: dict) -> list[dict]:
     tool_defs = []
     for tool in raw.get("tools", []):
         path = tool["path"]
-        name = path.lstrip("/")
+        raw_name = tool.get("name") or path.lstrip("/")
         params = tool.get("params", [])
 
         properties = {}
@@ -618,13 +760,18 @@ def _parse_schema(raw: dict) -> list[dict]:
                 pdef["description"] = p["description"]
             if "default" in p and p["default"] is not None:
                 pdef["default"] = p["default"]
+            if p.get("source"):
+                pdef["source"] = p["source"]
+            if p.get("param_type"):
+                pdef["param_type"] = p["param_type"]
             properties[p["name"]] = pdef
             if p.get("required", False):
                 required.append(p["name"])
 
         tool_defs.append(
             {
-                "name": name,
+                "name": raw_name,
+                "original_name": raw_name,
                 "endpoint": path,
                 "http_method": tool.get("method", "GET"),
                 "description": tool.get("description", ""),
@@ -638,7 +785,7 @@ def _parse_schema(raw: dict) -> list[dict]:
             }
         )
 
-    return tool_defs
+    return _normalize_tool_def_names(tool_defs)
 
 
 # ==========================================================================
@@ -654,7 +801,33 @@ STATIC_TOOL_NAMES = {
     "unload_tool_group",
     "check_tools",
     "import_file",
+    # Debugger tools (Phase 1+2+3)
+    "debugger_attach",
+    "debugger_detach",
+    "debugger_status",
+    "debugger_modules",
+    "debugger_resolve_ordinal",
+    "debugger_set_breakpoint",
+    "debugger_remove_breakpoint",
+    "debugger_list_breakpoints",
+    "debugger_continue",
+    "debugger_step_into",
+    "debugger_step_over",
+    "debugger_registers",
+    "debugger_read_memory",
+    "debugger_stack_trace",
+    "debugger_read_args",
+    "debugger_trace_function",
+    "debugger_trace_stop",
+    "debugger_trace_log",
+    "debugger_trace_list",
+    "debugger_watch_memory",
+    "debugger_watch_stop",
+    "debugger_watch_log",
 }
+
+for _static_tool_name in STATIC_TOOL_NAMES:
+    validate_tool_name(_static_tool_name)
 
 _dynamic_tool_names: list[str] = []
 _full_schema: list[dict] = []  # Complete parsed schema
@@ -664,7 +837,7 @@ _loaded_groups: set[str] = set()
 CORE_GROUPS = {"listing", "function", "program"}
 
 # CLI-configurable: --lazy keeps only default groups, otherwise load all
-_lazy_mode = True  # default: lazy (only load default groups on connect)
+_lazy_mode = False  # default: eager (load all groups on connect)
 _default_groups: set[str] = CORE_GROUPS
 
 
@@ -677,7 +850,7 @@ def _build_tool_function(endpoint: str, http_method: str, params_schema: dict):
         # Sanitize address parameters before dispatch
         for pname, pdef in properties.items():
             if (
-                pdef.get("paramType") == "address"
+                pdef.get("param_type") == "address"
                 and pname in kwargs
                 and kwargs[pname] is not None
             ):
@@ -693,7 +866,8 @@ def _build_tool_function(endpoint: str, http_method: str, params_schema: dict):
         # know which were defaults. Empty string is not a meaningful value
         # for any current Ghidra endpoint — safe to filter.
         filtered = {
-            k: v for k, v in kwargs.items()
+            k: v
+            for k, v in kwargs.items()
             if v is not None and not (isinstance(v, str) and v == "")
         }
         if http_method == "GET":
@@ -702,10 +876,20 @@ def _build_tool_function(endpoint: str, http_method: str, params_schema: dict):
                 str_params["dry_run"] = "true"
             return dispatch_get(endpoint, params=str_params if str_params else None)
         else:
-            query_params = None
+            body_data = {}
+            query_params = {}
+            for key, value in filtered.items():
+                if properties.get(key, {}).get("source") == "query":
+                    query_params[key] = str(value)
+                else:
+                    body_data[key] = value
             if dry_run:
-                query_params = {"dry_run": "true"}
-            return dispatch_post(endpoint, data=filtered, query_params=query_params)
+                query_params["dry_run"] = "true"
+            return dispatch_post(
+                endpoint,
+                data=body_data,
+                query_params=query_params or None,
+            )
 
     # Build function signature with proper types and defaults
     # Params with defaults must come after params without defaults
@@ -732,8 +916,10 @@ def _build_tool_function(endpoint: str, http_method: str, params_schema: dict):
     if http_method == "POST":
         sig_params.append(
             inspect.Parameter(
-                "dry_run", inspect.Parameter.KEYWORD_ONLY,
-                default=False, annotation=bool
+                "dry_run",
+                inspect.Parameter.KEYWORD_ONLY,
+                default=False,
+                annotation=bool,
             )
         )
     handler.__signature__ = inspect.Signature(sig_params, return_annotation=str)
@@ -746,6 +932,7 @@ def _build_tool_function(endpoint: str, http_method: str, params_schema: dict):
 def _register_tool_def(tool_def: dict) -> bool:
     """Register a single tool from a schema definition. Returns True if registered."""
     name = tool_def["name"]
+    validate_tool_name(name)
     if name in STATIC_TOOL_NAMES:
         return False  # Don't overwrite static tools
     description = tool_def.get("description", "")
@@ -785,16 +972,16 @@ def register_tools_from_schema(
     _loaded_groups.clear()
 
     # Store full schema for lazy loading
-    _full_schema = schema
+    _full_schema = _normalize_tool_def_names(schema)
 
     count = 0
-    for tool_def in schema:
+    for tool_def in _full_schema:
         category = tool_def.get("category", "unknown")
         if groups is not None and category not in groups:
             continue
-        _register_tool_def(tool_def)
-        _loaded_groups.add(category)
-        count += 1
+        if _register_tool_def(tool_def):
+            _loaded_groups.add(category)
+            count += 1
 
     return count
 
@@ -928,8 +1115,17 @@ async def connect_instance(project: str, ctx: Context | None = None) -> str:
     """
     Switch the MCP bridge to a different Ghidra instance by project name.
 
-    After connecting, fetches the tool schema from the instance and dynamically
-    registers all available tools. Use list_instances() first to see available instances.
+    IMPORTANT: Before calling this function only the static bridge tools are
+    exposed (list_instances, connect_instance, tool-group management,
+    debugger proxy). After a successful connect the bridge fetches the
+    instance's /mcp/schema and registers Ghidra analysis tools dynamically.
+    By default all tool groups are loaded on connect. When started with
+    --lazy, only the default groups are loaded initially and clients may need
+    to call load_tool_group() for additional categories. Clients that cache
+    the initial tools/list and don't honor tools/list_changed must re-list
+    tools after this call.
+
+    Use list_instances() first to see available instances.
 
     Args:
         project: Project name (or substring) to connect to
@@ -959,6 +1155,11 @@ async def connect_instance(project: str, ctx: Context | None = None) -> str:
             try:
                 count = _fetch_and_register_schema()
                 total = len(_full_schema)
+                note = (
+                    f"Loaded {count}/{total} tools (default groups). Use load_tool_group() for more."
+                    if _lazy_mode
+                    else f"Loaded all {count} tools on connect."
+                )
                 await _notify_tools_changed(ctx)
                 return json.dumps(
                     {
@@ -970,7 +1171,7 @@ async def connect_instance(project: str, ctx: Context | None = None) -> str:
                         "tools_registered": count,
                         "tools_total": total,
                         "loaded_groups": sorted(_loaded_groups),
-                        "note": f"Loaded {count}/{total} tools (core groups). Use load_tool_group() for more.",
+                        "note": note,
                     }
                 )
             except Exception as e:
@@ -992,6 +1193,11 @@ async def connect_instance(project: str, ctx: Context | None = None) -> str:
         _transport_mode = "tcp"
         count = _fetch_and_register_schema()
         total = len(_full_schema)
+        note = (
+            f"Loaded {count}/{total} tools (default groups). Use load_tool_group() for more."
+            if _lazy_mode
+            else f"Loaded all {count} tools on connect."
+        )
         await _notify_tools_changed(ctx)
         return json.dumps(
             {
@@ -1001,6 +1207,7 @@ async def connect_instance(project: str, ctx: Context | None = None) -> str:
                 "tools_registered": count,
                 "tools_total": total,
                 "loaded_groups": sorted(_loaded_groups),
+                "note": note,
             }
         )
     except Exception as e:
@@ -1303,6 +1510,406 @@ def _auto_connect():
 
 
 # ==========================================================================
+# Debugger tools (proxy to debugger/server.py on DEBUGGER_URL)
+# ==========================================================================
+
+DEBUGGER_URL = os.getenv("GHIDRA_DEBUGGER_URL", "http://127.0.0.1:8099")
+
+
+def _debugger_request(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    query: dict | None = None,
+    timeout: int = 30,
+) -> str:
+    """Send a request to the debugger server. Returns JSON string."""
+    parsed = urlparse(DEBUGGER_URL)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    try:
+        url = path
+        if query:
+            url += "?" + urlencode(query)
+        headers = {"Content-Type": "application/json"} if body else {}
+        conn.request(
+            method, url, body=json.dumps(body) if body else None, headers=headers
+        )
+        resp = conn.getresponse()
+        data = resp.read().decode("utf-8")
+        if resp.status >= 400:
+            try:
+                err = json.loads(data)
+                return json.dumps({"error": err.get("error", data)})
+            except Exception:
+                return json.dumps({"error": data})
+        return data
+    except ConnectionRefusedError:
+        return json.dumps(
+            {
+                "error": f"Debugger server not running at {DEBUGGER_URL}. "
+                "Start it with: python -m debugger"
+            }
+        )
+    except Exception as e:
+        return json.dumps({"error": f"Debugger request failed: {e}"})
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def debugger_attach(target: str) -> str:
+    """Attach the debugger to a running process for live dynamic analysis.
+
+    Connects to the target process via dbgeng (WinDbg engine). After attaching,
+    use debugger_modules() to see loaded DLLs and debugger_set_breakpoint() to
+    set breakpoints.
+
+    Args:
+        target: Process name (e.g. "Game.exe") or PID.
+    """
+    result = _debugger_request("POST", "/debugger/attach", {"target": target})
+
+    # Auto-sync address map if Ghidra is connected
+    if _transport_mode != "none":
+        try:
+            # Fetch image bases from Ghidra for all open programs
+            programs_text = dispatch_get("/list_open_programs")
+            if programs_text:
+                programs_data = json.loads(programs_text)
+                programs = (
+                    programs_data
+                    if isinstance(programs_data, list)
+                    else programs_data.get("programs", [])
+                )
+                ghidra_bases = {}
+                for prog in programs:
+                    prog_path = (
+                        prog
+                        if isinstance(prog, str)
+                        else prog.get("path", prog.get("name", ""))
+                    )
+                    if prog_path:
+                        try:
+                            meta_text = dispatch_get(
+                                "/get_metadata", params={"program": prog_path}
+                            )
+                            meta = json.loads(meta_text)
+                            image_base = meta.get("imageBase", meta.get("image_base"))
+                            if image_base:
+                                ghidra_bases[prog_path] = image_base
+                        except Exception:
+                            pass
+                if ghidra_bases:
+                    _debugger_request(
+                        "POST", "/debugger/sync_modules", {"ghidra_bases": ghidra_bases}
+                    )
+        except Exception as e:
+            logger.warning(f"Auto-sync address map failed (non-fatal): {e}")
+
+    return result
+
+
+@mcp.tool()
+def debugger_detach() -> str:
+    """Detach from the debugged process. The process continues running."""
+    return _debugger_request("POST", "/debugger/detach")
+
+
+@mcp.tool()
+def debugger_status() -> str:
+    """Get debugger connection status, loaded modules, active traces/watches."""
+    return _debugger_request("GET", "/debugger/status")
+
+
+@mcp.tool()
+def debugger_modules() -> str:
+    """List loaded modules (DLLs) with runtime and Ghidra base addresses.
+
+    Shows each module's name, runtime base, Ghidra base (if mapped),
+    and the address offset between them.
+    """
+    return _debugger_request("GET", "/debugger/modules")
+
+
+@mcp.tool()
+def debugger_resolve_ordinal(dll: str, ordinal: int) -> str:
+    """Resolve a DLL ordinal export to its runtime and Ghidra addresses.
+
+    Uses the ordinal export tables from dll_exports/*.txt combined with
+    the current runtime address map.
+
+    Args:
+        dll: DLL name (e.g. "D2Common.dll").
+        ordinal: Ordinal number (e.g. 10624).
+    """
+    return _debugger_request(
+        "GET", "/debugger/ordinal", query={"dll": dll, "ordinal": str(ordinal)}
+    )
+
+
+@mcp.tool()
+def debugger_set_breakpoint(
+    ghidra_address: str,
+    module: str = "",
+    bp_type: str = "software",
+    oneshot: bool = False,
+) -> str:
+    """Set a breakpoint at a Ghidra address. Auto-translates to runtime address.
+
+    Args:
+        ghidra_address: Address in Ghidra (e.g. "0x6FD9F450").
+        module: DLL name for disambiguation (e.g. "D2Common.dll").
+        bp_type: "software" (INT3) or "hardware" (debug register).
+        oneshot: If true, breakpoint is removed after first hit.
+    """
+    return _debugger_request(
+        "POST",
+        "/debugger/breakpoint",
+        {
+            "ghidra_address": ghidra_address,
+            "module": module,
+            "type": bp_type,
+            "oneshot": oneshot,
+        },
+    )
+
+
+@mcp.tool()
+def debugger_remove_breakpoint(bp_id: int) -> str:
+    """Remove a breakpoint by its ID.
+
+    Args:
+        bp_id: Breakpoint ID returned by debugger_set_breakpoint.
+    """
+    return _debugger_request("DELETE", f"/debugger/breakpoint/{bp_id}")
+
+
+@mcp.tool()
+def debugger_list_breakpoints() -> str:
+    """List all active breakpoints with their addresses and status."""
+    return _debugger_request("GET", "/debugger/breakpoints")
+
+
+@mcp.tool()
+def debugger_continue() -> str:
+    """Resume execution of the debugged process.
+
+    Returns immediately. The process runs until a breakpoint is hit,
+    an exception occurs, or debugger_interrupt() is called.
+    """
+    return _debugger_request("POST", "/debugger/go")
+
+
+@mcp.tool()
+def debugger_step_into(count: int = 1) -> str:
+    """Single-step into the next instruction(s). Follows calls.
+
+    Args:
+        count: Number of instructions to step (default 1).
+    """
+    return _debugger_request("POST", "/debugger/step_into", {"count": count})
+
+
+@mcp.tool()
+def debugger_step_over(count: int = 1) -> str:
+    """Step over the next instruction(s). Steps over calls.
+
+    Args:
+        count: Number of instructions to step (default 1).
+    """
+    return _debugger_request("POST", "/debugger/step_over", {"count": count})
+
+
+@mcp.tool()
+def debugger_registers() -> str:
+    """Read all CPU registers. Must be stopped at a breakpoint.
+
+    Returns EAX-EDI, ESP, EBP, EIP, EFLAGS for x86.
+    """
+    return _debugger_request("GET", "/debugger/registers")
+
+
+@mcp.tool()
+def debugger_read_memory(
+    address: str, size: int = 64, address_type: str = "runtime", module: str = ""
+) -> str:
+    """Read memory from the debugged process.
+
+    Returns hex dump and 32-bit DWORD interpretation of the memory region.
+
+    Args:
+        address: Memory address (hex, e.g. "0x6FD9F450").
+        size: Number of bytes to read (max 4096).
+        address_type: "runtime" for live address, "ghidra" to auto-translate.
+        module: DLL name when address_type="ghidra" for disambiguation.
+    """
+    return _debugger_request(
+        "GET",
+        "/debugger/memory",
+        query={
+            "address": address,
+            "size": str(size),
+            "address_type": address_type,
+            "module": module,
+        },
+    )
+
+
+@mcp.tool()
+def debugger_stack_trace(depth: int = 20) -> str:
+    """Get the call stack backtrace with return addresses mapped to Ghidra symbols.
+
+    Args:
+        depth: Maximum number of stack frames (default 20).
+    """
+    return _debugger_request("GET", "/debugger/stack", query={"depth": str(depth)})
+
+
+@mcp.tool()
+def debugger_read_args(
+    convention: str = "__stdcall", count: int = 4, arg_names: str = ""
+) -> str:
+    """Read function arguments at the current breakpoint based on calling convention.
+
+    Reads arguments from registers and stack according to the calling convention.
+    Must be stopped at a function entry point.
+
+    Args:
+        convention: __stdcall, __fastcall, __thiscall, or __cdecl.
+        count: Number of arguments to read.
+        arg_names: Comma-separated names for readability (e.g. "pUnit,nSkillId").
+    """
+    return _debugger_request(
+        "GET",
+        "/debugger/read_args",
+        query={"convention": convention, "count": str(count), "arg_names": arg_names},
+    )
+
+
+@mcp.tool()
+def debugger_trace_function(
+    ghidra_address: str,
+    module: str = "",
+    convention: str = "__stdcall",
+    arg_count: int = 4,
+    arg_names: str = "",
+    capture_return: bool = False,
+    max_hits: int = 0,
+) -> str:
+    """Start non-breaking tracing on a function. Logs every call with arguments
+    WITHOUT stopping the game.
+
+    The handler reads arguments and auto-resumes execution in ~0.5ms,
+    invisible at the game's 25fps. Use debugger_trace_log() to read results.
+
+    Args:
+        ghidra_address: Function address in Ghidra.
+        module: DLL name (e.g. "D2Common.dll").
+        convention: __stdcall, __fastcall, __thiscall, __cdecl.
+        arg_count: Number of arguments to capture.
+        arg_names: Comma-separated arg names (e.g. "pUnit,nSkillId,nWeaponSpeed").
+        capture_return: Also capture return value (EAX).
+        max_hits: Stop tracing after N hits (0 = unlimited).
+    """
+    return _debugger_request(
+        "POST",
+        "/debugger/trace/start",
+        {
+            "ghidra_address": ghidra_address,
+            "module": module,
+            "convention": convention,
+            "arg_count": arg_count,
+            "arg_names": arg_names,
+            "capture_return": capture_return,
+            "max_hits": max_hits,
+        },
+    )
+
+
+@mcp.tool()
+def debugger_trace_stop(trace_id: int = -1) -> str:
+    """Stop a function trace. Use trace_id=-1 to stop all traces.
+
+    Args:
+        trace_id: ID returned by debugger_trace_function, or -1 for all.
+    """
+    return _debugger_request("POST", "/debugger/trace/stop", {"trace_id": trace_id})
+
+
+@mcp.tool()
+def debugger_trace_log(trace_id: int = -1, last_n: int = 50) -> str:
+    """Read the trace log. Shows timestamped function calls with arguments.
+
+    Args:
+        trace_id: Filter by trace ID, or -1 for all traces.
+        last_n: Number of most recent entries to return.
+    """
+    return _debugger_request(
+        "GET",
+        "/debugger/trace/log",
+        query={"trace_id": str(trace_id), "last_n": str(last_n)},
+    )
+
+
+@mcp.tool()
+def debugger_trace_list() -> str:
+    """List all active and completed traces with hit counts."""
+    return _debugger_request("GET", "/debugger/trace/list")
+
+
+@mcp.tool()
+def debugger_watch_memory(
+    ghidra_address: str, size: int = 4, access: str = "write", module: str = ""
+) -> str:
+    """Set a hardware watchpoint on a memory range to monitor read/write access.
+
+    Limited to 4 simultaneous watchpoints (x86 debug register limit).
+    Use debugger_watch_log() to see hits.
+
+    Args:
+        ghidra_address: Start address in Ghidra.
+        size: Bytes to watch (1, 2, or 4).
+        access: "read", "write", or "readwrite".
+        module: DLL name for address resolution.
+    """
+    return _debugger_request(
+        "POST",
+        "/debugger/watch/start",
+        {
+            "ghidra_address": ghidra_address,
+            "module": module,
+            "size": size,
+            "access": access,
+        },
+    )
+
+
+@mcp.tool()
+def debugger_watch_stop(watch_id: int = -1) -> str:
+    """Stop a memory watchpoint. Use watch_id=-1 to stop all.
+
+    Args:
+        watch_id: ID returned by debugger_watch_memory, or -1 for all.
+    """
+    return _debugger_request("POST", "/debugger/watch/stop", {"watch_id": watch_id})
+
+
+@mcp.tool()
+def debugger_watch_log(watch_id: int = -1, last_n: int = 50) -> str:
+    """Read the watchpoint hit log. Shows memory accesses with values and accessors.
+
+    Args:
+        watch_id: Filter by watch ID, or -1 for all.
+        last_n: Number of most recent entries.
+    """
+    return _debugger_request(
+        "GET",
+        "/debugger/watch/log",
+        query={"watch_id": str(watch_id), "last_n": str(last_n)},
+    )
+
+
+# ==========================================================================
 # Main
 # ==========================================================================
 
@@ -1368,7 +1975,23 @@ def main():
     mcp.settings.host = args.mcp_host
     if args.mcp_port:
         mcp.settings.port = args.mcp_port
+
+    _host = args.mcp_host
+    if _host not in {"127.0.0.1", "localhost", "::1"}:
+        if _host in {"0.0.0.0", "::"}:
+            mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        else:
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=[f"{_host}:*", "localhost:*", "127.0.0.1:*"],
+                allowed_origins=[f"http://{_host}:*", "http://localhost:*", "http://127.0.0.1:*"],
+            )
     logger.info(f"Starting MCP bridge ({args.transport})")
+    if args.transport in ("sse", "streamable-http"):
+        host = args.mcp_host
+        port = args.mcp_port if args.mcp_port else mcp.settings.port
+        path = "/sse" if args.transport == "sse" else "/mcp"
+        logger.info(f"MCP endpoint: http://{host}:{port}{path}")
     mcp.run(transport=args.transport)
 
 

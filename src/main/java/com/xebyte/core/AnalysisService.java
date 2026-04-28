@@ -19,9 +19,12 @@ import ghidra.program.model.data.Pointer;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighSymbol;
 import ghidra.program.model.pcode.HighVariable;
+import ghidra.program.model.pcode.PcodeOp;
+import ghidra.program.model.pcode.PcodeOpAST;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
@@ -58,6 +61,47 @@ public class AnalysisService {
         this.programProvider = programProvider;
         this.threadingStrategy = threadingStrategy;
         this.functionService = functionService;
+    }
+
+    // ========================================================================
+    // Per-program tokenized-name cache (Copilot review feedback on PR #168)
+    // ========================================================================
+    // The name_collision deduction below would otherwise tokenize every
+    // function name in the program on every scoring call — O(n²) per
+    // binary-wide rescore. We cache the precomputed tokens per Program
+    // with a short TTL so batch scoring amortizes the work. WeakHashMap
+    // lets the entries get GC'd when a Program closes; the synchronized
+    // wrapper makes concurrent access safe.
+
+    private static final Map<Program, ProgramNameCache> NAME_CACHE =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+    private static final long NAME_CACHE_TTL_MS = 30_000L;
+
+    private static final class ProgramNameCache {
+        final List<NamingConventions.TokenizedName> tokenized;
+        final long timestamp;
+        ProgramNameCache(List<NamingConventions.TokenizedName> tokenized, long ts) {
+            this.tokenized = tokenized;
+            this.timestamp = ts;
+        }
+    }
+
+    private static List<NamingConventions.TokenizedName> getProgramTokenizedNames(Program program) {
+        if (program == null) return java.util.Collections.emptyList();
+        long now = System.currentTimeMillis();
+        ProgramNameCache cached = NAME_CACHE.get(program);
+        if (cached != null && (now - cached.timestamp) < NAME_CACHE_TTL_MS) {
+            return cached.tokenized;
+        }
+        List<String> names = new ArrayList<>();
+        for (Function f : program.getFunctionManager().getFunctions(true)) {
+            String n = f.getName();
+            if (n != null && !n.isEmpty()) names.add(n);
+        }
+        List<NamingConventions.TokenizedName> tokenized =
+                NamingConventions.precomputeTokenized(names);
+        NAME_CACHE.put(program, new ProgramNameCache(tokenized, now));
+        return tokenized;
     }
 
     // ========================================================================
@@ -1996,9 +2040,9 @@ public class AnalysisService {
     /**
      * Comprehensive function analysis combining decompilation, xrefs, callees, callers, disassembly, and variables
      */
-    @McpTool(path = "/analyze_function_complete", description = "Comprehensive single-call function analysis. Requires function name — if you only have an address, call get_function_by_address first.", category = "analysis")
+        @McpTool(path = "/analyze_function_complete", description = "Comprehensive single-call function analysis. Accepts function name or address.", category = "analysis")
     public Response analyzeFunctionComplete(
-            @Param(value = "name", description = "Function name (not an address — use get_function_by_address to resolve an address to a name first)") String name,
+            @Param(value = "name", description = "Function reference (name or address)") String name,
             @Param(value = "include_xrefs", defaultValue = "true") boolean includeXrefs,
             @Param(value = "include_callees", defaultValue = "true") boolean includeCallees,
             @Param(value = "include_callers", defaultValue = "true") boolean includeCallers,
@@ -2016,16 +2060,7 @@ public class AnalysisService {
         try {
             SwingUtilities.invokeAndWait(() -> {
                 try {
-                    Function func = null;
-                    FunctionManager funcMgr = program.getFunctionManager();
-
-                    // Find function by name
-                    for (Function f : funcMgr.getFunctions(true)) {
-                        if (f.getName().equals(name)) {
-                            func = f;
-                            break;
-                        }
-                    }
+                    Function func = ServiceUtils.resolveFunction(program, name);
 
                     if (func == null) {
                         errorMsg.set("Function not found: " + name);
@@ -2457,6 +2492,64 @@ public class AnalysisService {
             fixablePenalty += 20;
             breakdown.add(deductionItem("address_suffix_name", 20.0, true, 1,
                     "Function name ends with address suffix (e.g., _6FD93C30) — strip suffix and verify name"));
+        } else if (!isThunk && !isCompilerHelper) {
+            // Name-quality + collision deductions (Q6 calibration). Only fire
+            // for already-custom names — auto/address-suffix names already
+            // get a heavier deduction above. Thunks and compiler helpers are
+            // exempt: those names aren't model-authored.
+            String name = func.getName();
+            NamingConventions.NameQualityResult q =
+                    NamingConventions.checkFunctionNameQuality(name);
+            if (!q.ok) {
+                fixablePenalty += 8;
+                breakdown.add(deductionItem("low_name_quality", 8.0, true, 1,
+                        "Name '" + name + "' fails verb-tier specificity (" + q.issue + ")"));
+            }
+
+            // Token-subset collision against any other function in this
+            // program (same module-prefix scope). Uses a process-wide
+            // WeakHashMap cache (TTL 30s) of precomputed token-sets so
+            // batch scoring amortizes the per-name tokenization cost
+            // across calls (Copilot review on PR #168 flagged the prior
+            // O(n²) pattern of re-tokenizing every name on every score).
+            Program owner = func.getProgram();
+            List<NamingConventions.TokenizedName> tokenizedNames =
+                    getProgramTokenizedNames(owner);
+            if (!tokenizedNames.isEmpty()) {
+                String collidesWith = NamingConventions.findTokenSubsetCollisionPrecomputed(
+                        name, tokenizedNames);
+                if (collidesWith != null) {
+                    fixablePenalty += 10;
+                    breakdown.add(deductionItem("name_collision", 10.0, true, 1,
+                            "Token-subset collision with '" + collidesWith
+                                    + "' — names need a meaningful distinguisher"));
+                }
+            }
+
+            // Missing module prefix: name lacks UPPERCASE_ prefix AND ≥3 of
+            // its callees share a known prefix. Cheap and high-signal.
+            if (NamingConventions.extractModulePrefix(name) == null) {
+                Map<String, Integer> prefixCounts = new HashMap<>();
+                for (Function callee : func.getCalledFunctions(null)) {
+                    String pfx = NamingConventions.extractModulePrefix(callee.getName());
+                    if (pfx != null) prefixCounts.merge(pfx, 1, Integer::sum);
+                }
+                String dominantPrefix = null;
+                int dominantCount = 0;
+                for (Map.Entry<String, Integer> e : prefixCounts.entrySet()) {
+                    if (e.getValue() > dominantCount) {
+                        dominantCount = e.getValue();
+                        dominantPrefix = e.getKey();
+                    }
+                }
+                if (dominantCount >= 3 && dominantPrefix != null) {
+                    fixablePenalty += 5;
+                    breakdown.add(deductionItem("missing_module_prefix", 5.0, true, 1,
+                            "Name '" + name + "' has no module prefix but " + dominantCount
+                                    + " callees use '" + dominantPrefix
+                                    + "_' — consider prefixing this function the same way"));
+                }
+            }
         }
 
         if (func.getSignature() == null) {
@@ -4206,6 +4299,390 @@ public class AnalysisService {
         }
 
         return responseRef.get();
+    }
+
+    // ========================================================================
+    // Data flow analysis (#111)
+    // ========================================================================
+
+    private static final int DATAFLOW_DEFAULT_STEPS = 20;
+    private static final int DATAFLOW_MAX_STEPS = 200;
+
+    @McpTool(path = "/analyze_dataflow",
+             description = "Trace how a value propagates through a function using the decompiler's PCode graph. "
+                         + "Direction 'backward' walks producers (Varnode.getDef); 'forward' walks consumers "
+                         + "(Varnode.getDescendants). Terminates at constants, parameters, call boundaries, or max_steps. "
+                         + "Phi (MULTIEQUAL) nodes are summarized rather than recursed. On programs with multiple "
+                         + "address spaces, prefix addresses with the space name (mem:1000).",
+             category = "analysis")
+    public Response analyzeDataflow(
+            @Param(value = "address", paramType = "address",
+                   description = "Address inside the target function where the value is observed. "
+                               + "Accepts 0x<hex> or <space>:<hex>.") String addressStr,
+            @Param(value = "variable",
+                   description = "Anchor selector. Register name (EAX, RCX), HighVariable name (param_1, local_14, "
+                               + "iVar1), or empty to use the PcodeOp output at the address.",
+                   defaultValue = "") String variableHint,
+            @Param(value = "direction",
+                   description = "'backward' (producers) or 'forward' (consumers).",
+                   defaultValue = "backward") String direction,
+            @Param(value = "max_steps",
+                   description = "Cap on nodes visited. Default 20, max 200.",
+                   defaultValue = "20") int maxSteps,
+            @Param(value = "program",
+                   description = "Target program name (omit to use the active program — always specify when multiple programs are open)",
+                   defaultValue = "") String programName) {
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program resolvedProgram = pe.program();
+
+        Address anchorAddr = ServiceUtils.parseAddress(resolvedProgram, addressStr);
+        if (anchorAddr == null) return Response.err(ServiceUtils.getLastParseError());
+
+        boolean backward;
+        if (direction == null || direction.isEmpty() || "backward".equalsIgnoreCase(direction)) {
+            backward = true;
+        } else if ("forward".equalsIgnoreCase(direction)) {
+            backward = false;
+        } else {
+            return Response.err("direction must be 'forward' or 'backward'");
+        }
+
+        int stepCap = maxSteps <= 0 ? DATAFLOW_DEFAULT_STEPS : Math.min(maxSteps, DATAFLOW_MAX_STEPS);
+
+        final AtomicReference<Response> result = new AtomicReference<>();
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                try {
+                    Program program = resolvedProgram;
+                    Function func = program.getFunctionManager().getFunctionContaining(anchorAddr);
+                    if (func == null) {
+                        result.set(Response.err("No function contains address: " + addressStr));
+                        return;
+                    }
+
+                    DecompileResults decompResults = functionService.decompileFunctionNoRetry(func, program);
+                    if (decompResults == null || !decompResults.decompileCompleted()) {
+                        result.set(Response.err("Decompile failed for function " + func.getName()
+                            + (decompResults != null && decompResults.getErrorMessage() != null
+                                ? ": " + decompResults.getErrorMessage() : "")));
+                        return;
+                    }
+                    HighFunction hf = decompResults.getHighFunction();
+                    if (hf == null) {
+                        result.set(Response.err("No HighFunction available for " + func.getName()));
+                        return;
+                    }
+
+                    AnchorResolution anchor = resolveAnchorVarnode(hf, anchorAddr, variableHint, program);
+                    if (anchor.varnode == null) {
+                        result.set(Response.err(anchor.error != null ? anchor.error
+                            : "Could not resolve anchor varnode at " + addressStr
+                              + (variableHint == null || variableHint.isEmpty() ? "" : " for '" + variableHint + "'")));
+                        return;
+                    }
+
+                    DataflowChain chain = backward
+                        ? traceBackward(anchor.varnode, stepCap, program)
+                        : traceForward(anchor.varnode, stepCap, program);
+
+                    Map<String, Object> data = new LinkedHashMap<>();
+                    Map<String, Object> funcInfo = new LinkedHashMap<>();
+                    funcInfo.put("name", func.getName());
+                    funcInfo.put("entry", func.getEntryPoint().toString());
+                    data.put("function", funcInfo);
+
+                    Map<String, Object> anchorInfo = new LinkedHashMap<>();
+                    anchorInfo.put("address", anchorAddr.toString());
+                    anchorInfo.put("variable", describeVarnode(anchor.varnode, program));
+                    anchorInfo.put("resolved_from", anchor.resolvedFrom);
+                    data.put("anchor", anchorInfo);
+
+                    data.put("direction", backward ? "backward" : "forward");
+                    data.put("max_steps", stepCap);
+                    data.put("chain", chain.steps);
+                    data.put("terminated", chain.terminationReason);
+                    data.put("truncated", chain.truncated);
+
+                    result.set(Response.ok(data));
+                } catch (Exception e) {
+                    Msg.error(this, "Error in analyzeDataflow", e);
+                    result.set(Response.err(e.getMessage()));
+                }
+            });
+        } catch (InvocationTargetException | InterruptedException e) {
+            return Response.err("Thread synchronization error: " + e.getMessage());
+        }
+
+        return result.get();
+    }
+
+    /**
+     * Result of anchor varnode resolution: the chosen Varnode plus a short tag
+     * describing which of the candidate strategies matched (for response transparency).
+     */
+    private static final class AnchorResolution {
+        final Varnode varnode;
+        final String resolvedFrom;
+        final String error;
+
+        AnchorResolution(Varnode vn, String from) { this.varnode = vn; this.resolvedFrom = from; this.error = null; }
+        AnchorResolution(String errorMsg)        { this.varnode = null; this.resolvedFrom = null; this.error = errorMsg; }
+    }
+
+    /**
+     * Resolve the anchor Varnode given the user's hint. Strategy:
+     * 1. Empty hint -> output varnode of first PcodeOp at address.
+     * 2. Hint matches a register name -> varnode at that register address (input or output).
+     * 3. Hint matches a HighSymbol/HighVariable name -> that varnode.
+     * 4. Otherwise -> error listing candidate names at the address.
+     */
+    private AnchorResolution resolveAnchorVarnode(HighFunction hf, Address addr, String hint, Program program) {
+        List<PcodeOpAST> opsAtAddr = new ArrayList<>();
+        Iterator<PcodeOpAST> it = hf.getPcodeOps(addr);
+        while (it != null && it.hasNext()) opsAtAddr.add(it.next());
+        if (opsAtAddr.isEmpty()) {
+            return new AnchorResolution("No PCode operations at " + addr + " in function " + hf.getFunction().getName());
+        }
+
+        if (hint == null || hint.trim().isEmpty()) {
+            for (PcodeOpAST op : opsAtAddr) {
+                if (op.getOutput() != null) return new AnchorResolution(op.getOutput(), "output of " + mnemonic(op));
+            }
+            PcodeOpAST first = opsAtAddr.get(0);
+            if (first.getNumInputs() > 0) return new AnchorResolution(first.getInput(0), "input[0] of " + mnemonic(first));
+            return new AnchorResolution("No usable varnode at " + addr);
+        }
+
+        String hintTrimmed = hint.trim();
+
+        Register hintReg = program.getLanguage().getRegister(hintTrimmed);
+        if (hintReg != null) {
+            for (PcodeOpAST op : opsAtAddr) {
+                Varnode out = op.getOutput();
+                if (out != null && sameRegister(out, hintReg, program)) {
+                    return new AnchorResolution(out, "register " + hintReg.getName() + " (output of " + mnemonic(op) + ")");
+                }
+                for (int i = 0; i < op.getNumInputs(); i++) {
+                    Varnode in = op.getInput(i);
+                    if (sameRegister(in, hintReg, program)) {
+                        return new AnchorResolution(in, "register " + hintReg.getName() + " (input " + i + " of " + mnemonic(op) + ")");
+                    }
+                }
+            }
+        }
+
+        Set<String> candidates = new LinkedHashSet<>();
+        for (PcodeOpAST op : opsAtAddr) {
+            Varnode out = op.getOutput();
+            if (out != null) {
+                String nm = highName(out);
+                if (nm != null) candidates.add(nm);
+                if (nm != null && nm.equals(hintTrimmed)) {
+                    return new AnchorResolution(out, "HighVariable '" + nm + "' (output of " + mnemonic(op) + ")");
+                }
+            }
+            for (int i = 0; i < op.getNumInputs(); i++) {
+                Varnode in = op.getInput(i);
+                String nm = highName(in);
+                if (nm != null) candidates.add(nm);
+                if (nm != null && nm.equals(hintTrimmed)) {
+                    return new AnchorResolution(in, "HighVariable '" + nm + "' (input " + i + " of " + mnemonic(op) + ")");
+                }
+            }
+        }
+
+        return new AnchorResolution("No varnode at " + addr + " matches '" + hintTrimmed
+            + "'. Candidates: " + (candidates.isEmpty() ? "(none with HighVariable names)" : candidates.toString()));
+    }
+
+    /**
+     * Backward trace: follow Varnode.getDef() from the anchor, recording each producer op.
+     * Stops at constants, parameters/inputs (no def), or step cap.
+     */
+    private DataflowChain traceBackward(Varnode start, int stepCap, Program program) {
+        DataflowChain chain = new DataflowChain();
+        Deque<Varnode> frontier = new ArrayDeque<>();
+        Set<PcodeOp> seen = new HashSet<>();
+        frontier.push(start);
+        int step = 0;
+
+        while (!frontier.isEmpty()) {
+            if (step >= stepCap) {
+                chain.truncated = true;
+                chain.terminationReason = "max_steps";
+                return chain;
+            }
+            Varnode vn = frontier.pop();
+            if (vn == null || vn.isConstant()) {
+                chain.steps.add(terminalStep(step++, vn, "constant", program));
+                chain.terminationReason = "reached constant";
+                continue;
+            }
+            PcodeOp def = vn.getDef();
+            if (def == null) {
+                chain.steps.add(terminalStep(step++, vn, "input/parameter", program));
+                chain.terminationReason = "reached function input";
+                continue;
+            }
+            if (!seen.add(def)) continue;
+
+            chain.steps.add(buildStepRecord(step++, def, program));
+
+            int opcode = def.getOpcode();
+            if (opcode == PcodeOp.CALL || opcode == PcodeOp.CALLIND || opcode == PcodeOp.CALLOTHER) {
+                chain.terminationReason = "call boundary";
+                continue;
+            }
+            if (opcode == PcodeOp.MULTIEQUAL) {
+                // Phi node: summarize predecessors as a single step, do not recurse each branch.
+                continue;
+            }
+            for (int i = 0; i < def.getNumInputs(); i++) {
+                Varnode in = def.getInput(i);
+                if (in != null && !in.isConstant() && in.getDef() != null) {
+                    frontier.push(in);
+                }
+            }
+        }
+        if (chain.terminationReason == null) chain.terminationReason = "chain exhausted";
+        return chain;
+    }
+
+    /**
+     * Forward trace: follow Varnode.getDescendants() from the anchor, recording each consumer op.
+     * Stops at call boundaries, leaf consumers, or step cap.
+     */
+    private DataflowChain traceForward(Varnode start, int stepCap, Program program) {
+        DataflowChain chain = new DataflowChain();
+        Deque<Varnode> frontier = new ArrayDeque<>();
+        Set<PcodeOp> seen = new HashSet<>();
+        frontier.push(start);
+        int step = 0;
+
+        while (!frontier.isEmpty()) {
+            if (step >= stepCap) {
+                chain.truncated = true;
+                chain.terminationReason = "max_steps";
+                return chain;
+            }
+            Varnode vn = frontier.pop();
+            if (vn == null) continue;
+
+            Iterator<PcodeOp> dit = vn.getDescendants();
+            boolean anyConsumer = false;
+            while (dit != null && dit.hasNext() && step < stepCap) {
+                PcodeOp op = dit.next();
+                if (!seen.add(op)) continue;
+                anyConsumer = true;
+
+                chain.steps.add(buildStepRecord(step++, op, program));
+
+                int opcode = op.getOpcode();
+                if (opcode == PcodeOp.CALL || opcode == PcodeOp.CALLIND || opcode == PcodeOp.CALLOTHER) {
+                    chain.terminationReason = "call boundary";
+                    continue;
+                }
+                if (op.getOutput() != null) frontier.push(op.getOutput());
+            }
+            if (!anyConsumer && chain.terminationReason == null) {
+                chain.terminationReason = "reached leaf consumer";
+            }
+        }
+        if (chain.terminationReason == null) chain.terminationReason = "chain exhausted";
+        return chain;
+    }
+
+    private static final class DataflowChain {
+        final List<Map<String, Object>> steps = new ArrayList<>();
+        String terminationReason;
+        boolean truncated;
+    }
+
+    private Map<String, Object> buildStepRecord(int step, PcodeOp op, Program program) {
+        Map<String, Object> rec = new LinkedHashMap<>();
+        rec.put("step", step);
+        Address seq = op.getSeqnum() != null ? op.getSeqnum().getTarget() : null;
+        rec.put("address", seq != null ? seq.toString() : "");
+        rec.put("op", mnemonic(op));
+        rec.put("output", op.getOutput() != null ? describeVarnode(op.getOutput(), program) : null);
+        List<String> ins = new ArrayList<>();
+        for (int i = 0; i < op.getNumInputs(); i++) {
+            ins.add(describeVarnode(op.getInput(i), program));
+        }
+        rec.put("inputs", ins);
+        if (seq != null) {
+            ghidra.program.model.listing.Instruction instr = program.getListing().getInstructionAt(seq);
+            if (instr != null) rec.put("asm", instr.toString());
+        }
+        if (op.getOpcode() == PcodeOp.CALL && op.getNumInputs() > 0) {
+            Varnode target = op.getInput(0);
+            if (target != null && target.isAddress()) {
+                Function callee = program.getFunctionManager().getFunctionAt(target.getAddress());
+                if (callee != null) rec.put("callee", callee.getName());
+            }
+        }
+        if (op.getOpcode() == PcodeOp.MULTIEQUAL) {
+            rec.put("note", "phi node (control-flow merge); inputs list all predecessors");
+        }
+        return rec;
+    }
+
+    private Map<String, Object> terminalStep(int step, Varnode vn, String kind, Program program) {
+        Map<String, Object> rec = new LinkedHashMap<>();
+        rec.put("step", step);
+        rec.put("op", "TERMINAL");
+        rec.put("output", describeVarnode(vn, program));
+        rec.put("kind", kind);
+        return rec;
+    }
+
+    private static String mnemonic(PcodeOp op) {
+        String m = op.getMnemonic();
+        return m != null ? m : ("OP_" + op.getOpcode());
+    }
+
+    /** Stable, human-readable name for a Varnode. */
+    private static String describeVarnode(Varnode vn, Program program) {
+        if (vn == null) return "null";
+        if (vn.isConstant()) return "const:0x" + Long.toHexString(vn.getOffset());
+        if (vn.isRegister()) {
+            Register reg = program.getLanguage().getRegister(vn.getAddress(), vn.getSize());
+            if (reg != null) return reg.getName();
+        }
+        String nm = highName(vn);
+        if (nm != null) return nm;
+        if (vn.isAddress()) return "mem:" + vn.getAddress().toString();
+        if (vn.isUnique()) return "unique:" + Long.toHexString(vn.getOffset());
+        return "vn:" + vn.getAddress() + ":" + vn.getSize();
+    }
+
+    /**
+     * Extract HighVariable/HighSymbol name from a Varnode, or null.
+     * Filters out Ghidra's "UNNAMED" placeholder — that's the default name for
+     * anonymous intermediate HighVariables and is less informative than a
+     * unique/mem/register label.
+     */
+    private static String highName(Varnode vn) {
+        if (vn == null) return null;
+        HighVariable hv = vn.getHigh();
+        if (hv == null) return null;
+        HighSymbol sym = hv.getSymbol();
+        if (sym != null) {
+            String symName = sym.getName();
+            if (symName != null && !symName.isEmpty() && !"UNNAMED".equals(symName)) return symName;
+        }
+        String n = hv.getName();
+        if (n != null && !n.isEmpty() && !"UNNAMED".equals(n)) return n;
+        return null;
+    }
+
+    private static boolean sameRegister(Varnode vn, Register target, Program program) {
+        if (vn == null || !vn.isRegister()) return false;
+        Register r = program.getLanguage().getRegister(vn.getAddress(), vn.getSize());
+        if (r == null) return false;
+        return r.equals(target) || target.contains(r) || r.contains(target);
     }
 }
 

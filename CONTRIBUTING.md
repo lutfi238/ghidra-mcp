@@ -6,8 +6,10 @@ Thank you for your interest in contributing to Ghidra MCP! This guide explains h
 
 - **Issues**: [GitHub Issues](https://github.com/bethington/ghidra-mcp/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/bethington/ghidra-mcp/discussions)
-- **Documentation**: [DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md)
-- **Tools Reference**: [docs/TOOL_REFERENCE.md](docs/TOOL_REFERENCE.md)
+- **Documentation**: [docs/README.md](docs/README.md)
+- **Tools Reference**: [tests/endpoints.json](tests/endpoints.json)
+
+If your team depends on Ghidra MCP in production or client work, please consider [sponsoring the project](https://github.com/sponsors/bethington) to help fund maintenance and compatibility updates.
 
 ---
 
@@ -31,7 +33,7 @@ Title: Decompile timeout on binary > 10MB
 
 Environment:
 - OS: Windows 11
-- Ghidra: 12.0.3
+- Ghidra: 12.0.4
 - Binary: 12MB x86-64
 
 Steps:
@@ -159,18 +161,15 @@ Priority: Medium - helpful for malware analysis
    }
    ```
 
-3. Document in `docs/TOOL_REFERENCE.md`:
-   ```markdown
-   ### my_new_tool()
-   
-   Brief description.
-   
-   ```python
-   result = my_new_tool(param1="value", param2=5)
-   # Returns: {...}
-   ```
-   
-   **Use when**: Specific use case
+3. Document in `tests/endpoints.json`:
+   ```json
+   {
+     "path": "/my_new_tool",
+     "method": "GET",
+     "category": "analysis",
+     "params": ["param1", "param2", "program"],
+     "description": "Brief description."
+   }
    ```
 
 4. Add example in `examples/`:
@@ -204,10 +203,10 @@ Priority: Medium - helpful for malware analysis
 **How**:
 ```bash
 # 1. Edit documentation
-vim docs/TOOL_REFERENCE.md
+vim tests/endpoints.json
 
 # 2. Preview if possible
-cat docs/TOOL_REFERENCE.md | grep "my_section"
+cat tests/endpoints.json | grep "my_section"
 
 # 3. Commit
 git commit -m "docs: Clarify batch operation performance benefits"
@@ -216,6 +215,19 @@ git commit -m "docs: Clarify batch operation performance benefits"
 ---
 
 ## Code Style & Standards
+
+## Resource Ownership Checklist
+
+Use this checklist whenever you touch Ghidra services, headless code, or bundled scripts.
+
+- `DecompInterface`, emulators, and other disposable Ghidra helpers must be owned by the smallest possible scope and released in `finally`.
+- Ghidra transactions started with `startTransaction(...)` must always end in `finally` with the correct success flag.
+- Opened `Program`, `DomainObject`, or project resources must be released on every exit path.
+- `ProcessBuilder` or `subprocess` launches must have an explicit lifecycle decision: either detached fire-and-forget with a comment explaining why, or a waited/observed child with exit-code handling.
+- Child-process stdout/stderr streams must be drained and closed. Prefer try-with-resources in Java and context-managed pipes in Python.
+- Long-running waits need a timeout or an explicit justification for blocking indefinitely.
+- If a script intentionally blocks on an external tool, surface enough logging to show what command ran and whether it exited cleanly.
+- New endpoints and automation paths should prefer bounded network timeouts over unbounded waits.
 
 ### Java (GhidraMCPPlugin.java)
 
@@ -381,8 +393,8 @@ pytest tests/ -v
 ### Prerequisites
 - Java 21 LTS
 - Apache Maven 3.9+
-- Python 3.8+
-- Ghidra 12.0.3
+- Python 3.10+
+- Ghidra 12.0.4
 
 ### Local Development
 ```bash
@@ -390,21 +402,20 @@ pytest tests/ -v
 git clone https://github.com/YOUR-USERNAME/ghidra-mcp.git
 cd ghidra-mcp
 
-# 2. Install Ghidra libraries to local Maven repo
-.\ghidra-mcp-setup.ps1 -SetupDeps -GhidraPath "C:\path\to\ghidra"  # Windows
+# 2. Run preflight against your Ghidra install
+python -m tools.setup preflight --ghidra-path "C:\path\to\ghidra"
 
-# 3. Build plugin
-mvn clean package
+# 3. Install prerequisites
+python -m tools.setup ensure-prereqs --ghidra-path "C:\path\to\ghidra"
 
-# 4. Install Python dependencies
-pip install -r requirements.txt
-pip install -r requirements-test.txt
+# 4. Build plugin artifacts
+python -m tools.setup build
 
 # 5. Run MCP server
 python bridge_mcp_ghidra.py
 
 # 6. Run tests
-mvn test
+python -m tools.setup run-tests
 pytest tests/ -v
 ```
 
@@ -414,7 +425,7 @@ pytest tests/ -v
 # Manually update docs/ folder
 
 # Preview markdown
-cat docs/TOOL_REFERENCE.md | more
+cat tests/endpoints.json | more
 
 # Check for linting errors (optional)
 markdownlint docs/
@@ -460,7 +471,7 @@ Closes #123
 - **Issues**: Check existing issues first
 - **Documentation**: See DOCUMENTATION_INDEX.md
 - **Examples**: See examples/ directory
-- **API**: See docs/TOOL_REFERENCE.md
+- **API**: See tests/endpoints.json
 
 ---
 

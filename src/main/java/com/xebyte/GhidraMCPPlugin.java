@@ -25,6 +25,7 @@ import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.services.CodeViewerService;
+import ghidra.app.services.DebuggerTraceManagerService;
 import ghidra.app.services.GoToService;
 
 import ghidra.app.script.GhidraScriptUtil;
@@ -41,6 +42,7 @@ import ghidra.framework.plugintool.util.PluginStatus;
 import ghidra.program.util.ProgramLocation;
 import ghidra.util.Msg;
 import ghidra.util.task.ConsoleTaskMonitor;
+import ghidra.trace.model.Trace;
 import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
@@ -92,6 +94,7 @@ import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -99,27 +102,32 @@ import java.util.regex.Pattern;
 
 // Load version from properties file (populated by Maven during build)
 class VersionInfo {
-    private static String VERSION = "5.3.2"; // Default fallback
+    private static String VERSION = "5.6.0"; // Default fallback
     private static String APP_NAME = "GhidraMCP";
     private static String GHIDRA_VERSION = "unknown"; // Loaded from version.properties (Maven-filtered)
     private static String BUILD_TIMESTAMP = "dev"; // Will be replaced by Maven
     private static String BUILD_NUMBER = "0"; // Will be replaced by Maven
-    private static final int ENDPOINT_COUNT = 175;
+    private static final int ENDPOINT_COUNT = 177;
 
     static {
+        // v5.4.2: loading "/version.properties" from the classpath root was
+        // hitting a sibling version.properties exported by another Ghidra
+        // module, which resolved first and returned stale values. Move the
+        // resource under the com/xebyte/ package path so the lookup is scoped
+        // to this plugin's classes.
         try (InputStream input = GhidraMCPPlugin.class
-                .getResourceAsStream("/version.properties")) {
+                .getResourceAsStream("/com/xebyte/version.properties")) {
             if (input != null) {
                 Properties props = new Properties();
                 props.load(input);
-                VERSION = props.getProperty("app.version", "5.3.2");
-                APP_NAME = props.getProperty("app.name", "GhidraMCP");
-                GHIDRA_VERSION = props.getProperty("ghidra.version", "unknown");
-                BUILD_TIMESTAMP = props.getProperty("build.timestamp", "dev");
-                BUILD_NUMBER = props.getProperty("build.number", "0");
+                VERSION = props.getProperty("app.version", VERSION);
+                APP_NAME = props.getProperty("app.name", APP_NAME);
+                GHIDRA_VERSION = props.getProperty("ghidra.version", GHIDRA_VERSION);
+                BUILD_TIMESTAMP = props.getProperty("build.timestamp", BUILD_TIMESTAMP);
+                BUILD_NUMBER = props.getProperty("build.number", BUILD_NUMBER);
             }
         } catch (IOException e) {
-            // Use defaults if file not found
+            // Use defaults (hard-coded above) if file not found.
         }
     }
 
@@ -158,7 +166,7 @@ class VersionInfo {
     category = PluginCategoryNames.COMMON,
     shortDescription = "GhidraMCP - HTTP server plugin",
     description = "GhidraMCP - Starts an embedded HTTP server to expose program data via REST API and MCP bridge. " +
-                  "Provides 165 endpoints for reverse engineering automation. " +
+                  "Provides 177 endpoints for reverse engineering automation. " +
                   "Port configurable via Tool Options. " +
                   "Features: function analysis, decompilation, symbol management, cross-references, label operations, " +
                   "high-performance batch data analysis, field-level structure analysis, advanced call graph analysis, " +
@@ -228,6 +236,9 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     private final com.xebyte.core.AnalysisService analysisService;
     private final com.xebyte.core.MalwareSecurityService malwareSecurityService;
     private final com.xebyte.core.ProgramScriptService programScriptService;
+    private final com.xebyte.core.EmulationService emulationService;
+    private final com.xebyte.core.DebuggerService debuggerService;
+    private final com.xebyte.core.PromptPolicyService promptPolicyService;
 
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
@@ -247,17 +258,27 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         this.analysisService = new com.xebyte.core.AnalysisService(programProvider, threadingStrategy, this.functionService);
         this.malwareSecurityService = new com.xebyte.core.MalwareSecurityService(programProvider, threadingStrategy);
         this.programScriptService = new com.xebyte.core.ProgramScriptService(programProvider, threadingStrategy);
+        this.emulationService = new com.xebyte.core.EmulationService(programProvider, threadingStrategy);
+        this.debuggerService = new com.xebyte.core.DebuggerService(programProvider, threadingStrategy, tool);
+        this.promptPolicyService = new com.xebyte.core.PromptPolicyService();
         Msg.info(this, "============================================");
         Msg.info(this, "GhidraMCP " + VersionInfo.getFullVersion());
         Msg.info(this, "Endpoints: " + VersionInfo.getEndpointCount());
         Msg.info(this, "============================================");
 
-        // Server authenticator: GhidraMCPAuthInitializer (ModuleInitializer) handles
-        // early registration from GHIDRA_SERVER_PASSWORD env var — runs before project opens.
-        // The /server/authenticate endpoint handles runtime credential updates.
+        // Server authenticator: ensure credentials are registered before any project opens.
+        // GhidraMCPAuthInitializer implements ModuleInitializer, but that ExtensionPoint
+        // is only reliable for Ghidra's own built-in modules — user extensions may not be
+        // discovered by ClassSearcher in time. Call run() explicitly here as a guaranteed
+        // fallback; it has an idempotency guard so double-invocation is safe.
+        if (!com.xebyte.core.GhidraMCPAuthInitializer.isRegistered()) {
+            new com.xebyte.core.GhidraMCPAuthInitializer().run();
+        }
         if (com.xebyte.core.GhidraMCPAuthInitializer.isRegistered()) {
             this.authenticator = com.xebyte.core.GhidraMCPAuthInitializer.getAuthenticator();
-            Msg.info(this, "GhidraMCP: Server authenticator was registered at startup");
+            Msg.info(this, "GhidraMCP: Server authenticator registered — auto-login active");
+        } else {
+            Msg.info(this, "GhidraMCP: No server credentials configured — GUI auth will be used");
         }
 
         // Register configuration options
@@ -469,7 +490,8 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         AnnotationScanner scanner = new AnnotationScanner(programProvider,
             listingService, functionService, commentService, symbolLabelService,
             xrefCallGraphService, dataTypeService, analysisService,
-            documentationHashService, malwareSecurityService, programScriptService);
+            documentationHashService, malwareSecurityService, programScriptService,
+            emulationService, debuggerService, promptPolicyService);
 
         for (EndpointDef ep : scanner.getEndpoints()) {
             server.createContext(ep.path(), safeHandler(exchange -> {
@@ -636,15 +658,18 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
 
         server.createContext("/exit_ghidra", safeHandler(exchange -> {
             try {
-                // Save first, then exit
-                String saveResult = saveCurrentProgram(null);
-                sendResponse(exchange, "{\"success\": true, \"message\": \"Saving and exiting Ghidra\", \"save\": " + saveResult + "}");
+                promptPolicyService.enableFor("exit_ghidra", 30);
+                Map<String, Object> saveResult = saveEverythingBeforeExit();
+                sendResponse(exchange, JsonHelper.toJson(JsonHelper.mapOf(
+                    "success", true,
+                    "message", "Saving all open programs and traces, then exiting Ghidra",
+                    "save", saveResult
+                )));
                 // Schedule exit after response is sent
                 new Thread(() -> {
                     try { Thread.sleep(500); } catch (InterruptedException ignored) {}
                     SwingUtilities.invokeLater(() -> {
-                        PluginTool t = getTool();
-                        if (t != null) t.close();
+                        closeGhidraWithoutSavingToolLayouts();
                     });
                 }).start();
             } catch (Throwable e) {
@@ -1718,6 +1743,113 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         return programScriptService.saveCurrentProgram(programName).toJson();
     }
 
+    private Map<String, Object> saveEverythingBeforeExit() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("programs", JsonHelper.parseJson(programScriptService.saveAllOpenPrograms().toJson()));
+        result.put("traces", saveAllOpenDebuggerTraces());
+        return result;
+    }
+
+    private void closeGhidraWithoutSavingToolLayouts() {
+        PluginTool currentTool = getTool();
+        if (currentTool == null) {
+            return;
+        }
+
+        Set<PluginTool> tools = Collections.newSetFromMap(new IdentityHashMap<>());
+        tools.add(currentTool);
+        try {
+            Project project = currentTool.getProject();
+            if (project != null && project.getToolManager() != null) {
+                for (PluginTool runningTool : project.getToolManager().getRunningTools()) {
+                    if (runningTool != null) {
+                        tools.add(runningTool);
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            Msg.warn(this, "Unable to enumerate running tools before exit: " + e.getMessage());
+        }
+
+        for (PluginTool tool : tools) {
+            try {
+                tool.setConfigChanged(false);
+            } catch (Throwable e) {
+                Msg.warn(this, "Unable to clear tool layout change flag: " + e.getMessage());
+            }
+        }
+
+        currentTool.close();
+    }
+
+    private Map<String, Object> saveAllOpenDebuggerTraces() {
+        List<Map<String, Object>> saved = new ArrayList<>();
+        List<Map<String, Object>> errors = new ArrayList<>();
+        Set<Trace> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+
+        PluginTool currentTool = getTool();
+        if (currentTool == null || currentTool.getProject() == null) {
+            return JsonHelper.mapOf(
+                "success", true,
+                "saved_count", 0,
+                "traces", saved,
+                "errors", errors,
+                "message", "No project/tool available for trace save"
+            );
+        }
+
+        List<PluginTool> tools = new ArrayList<>();
+        tools.add(currentTool);
+        try {
+            ghidra.framework.model.ToolManager tm = currentTool.getProject().getToolManager();
+            if (tm != null) {
+                for (PluginTool runningTool : tm.getRunningTools()) {
+                    if (runningTool != null && !tools.contains(runningTool)) {
+                        tools.add(runningTool);
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            errors.add(JsonHelper.mapOf(
+                "error", "Unable to enumerate running tools: " +
+                    (e.getMessage() != null ? e.getMessage() : e.toString())
+            ));
+        }
+
+        for (PluginTool runningTool : tools) {
+            DebuggerTraceManagerService traceMgr = runningTool.getService(DebuggerTraceManagerService.class);
+            if (traceMgr == null) {
+                continue;
+            }
+            List<Trace> traces = new ArrayList<>(traceMgr.getOpenTraces());
+            for (Trace trace : traces) {
+                if (trace == null || !seen.add(trace)) {
+                    continue;
+                }
+
+                Map<String, Object> info = new LinkedHashMap<>();
+                info.put("trace", trace.getName());
+                info.put("tool", runningTool.getName());
+                try {
+                    traceMgr.saveTrace(trace).get(30, TimeUnit.SECONDS);
+                    traceMgr.closeTraceNoConfirm(trace);
+                    saved.add(info);
+                } catch (Throwable e) {
+                    info.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
+                    errors.add(info);
+                    Msg.error(this, "Error saving debugger trace " + trace.getName(), e);
+                }
+            }
+        }
+
+        return JsonHelper.mapOf(
+            "success", errors.isEmpty(),
+            "saved_count", saved.size(),
+            "traces", saved,
+            "errors", errors
+        );
+    }
+
     private String listOpenPrograms() {
         return programScriptService.listOpenPrograms().toJson();
     }
@@ -1809,12 +1941,36 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      */
     private static final long SLOW_HANDLER_WARN_MS = 2000;
 
+    /**
+     * Read-only health endpoints that bypass the auth check even when
+     * GHIDRA_MCP_AUTH_TOKEN is configured. Keep this set minimal — anything
+     * that reveals program state or accepts writes must require auth.
+     */
+    private static boolean isAuthExempt(String path) {
+        return "/mcp/health".equals(path) || "/check_connection".equals(path);
+    }
+
     private com.sun.net.httpserver.HttpHandler safeHandler(com.sun.net.httpserver.HttpHandler handler) {
         return exchange -> {
             long startNanos = System.nanoTime();
             String path = exchange.getRequestURI().getPath();
             activeRequests.incrementAndGet();
             try {
+                if (!isAuthExempt(path)) {
+                    com.xebyte.core.SecurityConfig sec = com.xebyte.core.SecurityConfig.getInstance();
+                    if (sec.isAuthEnabled()) {
+                        String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
+                        if (!sec.matchesBearerAuth(authHeader)) {
+                            byte[] body = "{\"error\": \"Unauthorized\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                            exchange.getResponseHeaders().set("Content-Type", "application/json");
+                            exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer");
+                            exchange.sendResponseHeaders(401, body.length);
+                            exchange.getResponseBody().write(body);
+                            exchange.getResponseBody().close();
+                            return;
+                        }
+                    }
+                }
                 handler.handle(exchange);
             } catch (Throwable e) {
                 try {
@@ -2558,7 +2714,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      */
     @SuppressWarnings("deprecation")
     private String getFunctionVariables(String functionName, String programName) {
-        return functionService.getFunctionVariables(functionName, programName, null, null).toJson();
+        return functionService.getFunctionVariables(functionName, null, programName, null, null).toJson();
     }
 
     // Backward compatibility overload

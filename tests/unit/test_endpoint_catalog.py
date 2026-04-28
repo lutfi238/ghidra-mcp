@@ -125,20 +125,44 @@ class TestEndpointsJson(unittest.TestCase):
             self.assertIn("path", ep, f"Missing 'path' in endpoint: {ep}")
             self.assertIn("method", ep, f"Missing 'method' in endpoint: {ep}")
 
+    @unittest.skipUnless(ENDPOINTS_JSON.exists(), "endpoints.json not found")
+    def test_catalog_tool_names_are_capi_safe_after_bridge_parsing(self):
+        """The generated endpoint catalog should produce valid exposed MCP names."""
+        from bridge_mcp_ghidra import _parse_schema
+
+        data = json.loads(ENDPOINTS_JSON.read_text())
+        raw_schema = {
+            "tools": [
+                {
+                    "path": ep["path"],
+                    "method": ep.get("method", "GET"),
+                    "params": [],
+                }
+                for ep in data.get("endpoints", [])
+            ]
+        }
+        invalid = [
+            tool["name"] for tool in _parse_schema(raw_schema)
+            if not re.fullmatch(r"^[a-zA-Z0-9_-]+$", tool["name"])
+        ]
+        self.assertEqual(invalid, [])
+
 
 class TestBridgeIsDynamic(unittest.TestCase):
     """Verify the bridge uses dynamic registration, not hardcoded tools."""
 
     def test_bridge_has_few_static_tools(self):
-        """Bridge should only have static tools (list_instances, connect_instance, tool group mgmt)."""
+        """Bridge static tool decorators should match the explicit static tool allowlist."""
+        import bridge_mcp_ghidra as bridge
+
         bridge_path = PROJECT_ROOT / "bridge_mcp_ghidra.py"
         content = bridge_path.read_text()
         tool_count = len(re.findall(r"@mcp\.tool\(\)", content))
-        self.assertLessEqual(
+        self.assertEqual(
             tool_count,
-            10,
-            f"Bridge has {tool_count} @mcp.tool() decorators. "
-            "Expected <=10 (only static tools)",
+            len(bridge.STATIC_TOOL_NAMES),
+            f"Bridge has {tool_count} @mcp.tool() decorators but "
+            f"{len(bridge.STATIC_TOOL_NAMES)} static tool names",
         )
 
     def test_bridge_has_schema_registration(self):
@@ -149,11 +173,11 @@ class TestBridgeIsDynamic(unittest.TestCase):
         self.assertIn("/mcp/schema", content)
 
     def test_bridge_size_reasonable(self):
-        """Thin bridge should stay manageable while allowing modest feature growth."""
+        """Thin bridge should stay manageable while allowing debugger/tool-group growth."""
         bridge_path = PROJECT_ROOT / "bridge_mcp_ghidra.py"
         lines = len(bridge_path.read_text().splitlines())
         self.assertLess(
-            lines, 1400, f"Bridge is {lines} lines, expected <1400 for thin multiplexer"
+            lines, 2000, f"Bridge is {lines} lines, expected <2000 for thin multiplexer"
         )
 
 
