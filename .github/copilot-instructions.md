@@ -1,76 +1,88 @@
-# Ghidra MCP — Copilot Instructions
+# Ghidra MCP - Copilot Instructions
 
-MCP server bridging Ghidra reverse engineering with AI tools. Java (Ghidra extension) + Python (MCP bridge), 199 MCP tools.
+MCP server bridging Ghidra reverse engineering with AI tools. Java Ghidra extension + Python MCP bridge, version `5.6.0`, Java `21`, Ghidra `12.0.4`, and `225` cataloged MCP tools.
 
 ## Architecture
 
-```
-AI Tools <-> MCP Bridge (bridge_mcp_ghidra.py) <-> Ghidra Plugin (GhidraMCPPlugin.jar)
+```text
+AI tools <-> MCP bridge (bridge_mcp_ghidra.py) <-> Ghidra HTTP server <-> Ghidra services
 ```
 
-- **Plugin**: `src/main/java/com/xebyte/GhidraMCPPlugin.java` — HTTP server on port 8089, delegates to services
-- **Bridge**: `bridge_mcp_ghidra.py` — dynamic tool registration from `/mcp/schema` + 7 static tools
-- **Services**: `src/main/java/com/xebyte/core/` — 12 service classes, `@McpTool`/`@Param` annotated
-- **Headless**: `src/main/java/com/xebyte/headless/` — standalone server without GUI
-- **Annotation Scanner**: `AnnotationScanner.java` auto-discovers `@McpTool` methods, generates `/mcp/schema`
+- `bridge_mcp_ghidra.py` fetches `/mcp/schema` from the running Ghidra server and dynamically registers tools. It also owns static bridge/debugger helpers.
+- `src/main/java/com/xebyte/GhidraMCPPlugin.java` is the GUI plugin entry point and HTTP server bootstrap.
+- `src/main/java/com/xebyte/core/` contains shared `@McpTool` services registered through `AnnotationScanner`.
+- `src/main/java/com/xebyte/headless/` contains the standalone headless server and project/program lifecycle support.
+- `debugger/` exposes the optional debugger HTTP server on `GHIDRA_DEBUGGER_URL`.
+- `fun-doc/` is an internal documentation curation subsystem, not the MCP plugin API.
 
-## Build & Test Commands
+## Build And Test Commands
 
 ```powershell
-# Build
-mvn clean package assembly:single -DskipTests
+# Supported build facade
+python -m tools.setup build
 
-# Quick compile check
+# Quick Java compile
 mvn clean compile -q
 
-# Offline tests (no Ghidra required)
+# Manual Maven extension package
+mvn clean package assembly:single -DskipTests
+
+# Offline tests, no live Ghidra server
 mvn test -Dtest='com.xebyte.offline.*Test'
 pytest tests/unit/ -v --no-cov
 
-# Full integration tests (Ghidra on port 8089)
-mvn test
-pytest tests/
+# Setup-script tests after ghidra-mcp-setup.ps1 changes
+.\tests\pester\Run-Tests.ps1 -CI
 
-# Regenerate endpoint catalog after @McpTool changes
+# Regenerate endpoint catalog after @McpTool/@Param changes
 mvn test -Dtest=RegenerateEndpointsJson -Dregenerate=true
 
-# Deploy
-.\ghidra-mcp-setup.ps1 -Deploy
+# Preflight and deploy
+python -m tools.setup preflight --ghidra-path F:\ghidra_12.0.4_PUBLIC
+python -m tools.setup ensure-prereqs --ghidra-path F:\ghidra_12.0.4_PUBLIC
+python -m tools.setup build
+python -m tools.setup deploy --ghidra-path F:\ghidra_12.0.4_PUBLIC
 
 # Version bump
-.\bump-version.ps1 -New X.Y.Z
+python -m tools.setup bump-version --new X.Y.Z
 ```
 
-## Adding New Endpoints
+`tools.setup` uses Maven by default. Gradle support exists behind `TOOLS_SETUP_BACKEND=gradle` and for direct/manual migration validation.
 
-1. Add `@McpTool` + `@Param` method in the appropriate service class under `src/main/java/com/xebyte/core/`
-2. `AnnotationScanner` auto-discovers it — no bridge or registry changes needed
-3. Add entry to `tests/endpoints.json` with path, method, category, description
-4. If `EndpointsJsonParityTest` fails, regenerate with `mvn test -Dtest=RegenerateEndpointsJson -Dregenerate=true`
+## Adding Or Changing Endpoints
 
-For complex tools needing bridge-side logic, add a static `@mcp.tool()` in `bridge_mcp_ghidra.py` and add the name to `STATIC_TOOL_NAMES`.
+1. Add or update the `@McpTool` method in the relevant service class under `src/main/java/com/xebyte/core/` or headless service when the endpoint is headless-only.
+2. Follow existing response, parameter, `ProgramProvider`, and `ThreadingStrategy` patterns in the same service.
+3. Route naming-sensitive changes through `NamingConventions.java`.
+4. Wrap Ghidra database writes in transactions and close disposable Ghidra helpers in `finally`.
+5. Update `tests/endpoints.json`; if needed, regenerate with `mvn test -Dtest=RegenerateEndpointsJson -Dregenerate=true`.
+6. Run offline Java tests and targeted Python tests.
 
-## Code Conventions
+For complex bridge-side orchestration, add a static `@mcp.tool()` in `bridge_mcp_ghidra.py` and add its name to `STATIC_TOOL_NAMES`.
 
-- All endpoints return JSON
-- Transactions must be committed for Ghidra database changes
-- Prefer batch operations over individual calls
-- `@Param(value = "program")` defaults to `ParamSource.QUERY` — POST endpoints must send `program` as URL query param, not in JSON body
-- Wire naming validation through `NamingConventions.java`
-- Services use constructor injection: `ProgramProvider` + `ThreadingStrategy`
-- GUI operations from HTTP threads must use `SwingUtilities.invokeAndWait()`
+## Change-To-Test Mapping
 
-## Key Files
-
-- **Endpoint catalog**: `tests/endpoints.json` (199 endpoints, authoritative)
-- **Tool usage guide**: [docs/prompts/TOOL_USAGE_GUIDE.md](docs/prompts/TOOL_USAGE_GUIDE.md)
-- **Naming conventions**: [docs/NAMING_CONVENTIONS.md](docs/NAMING_CONVENTIONS.md)
-- **Changelog**: [CHANGELOG.md](CHANGELOG.md)
-- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
+- `bridge_mcp_ghidra.py`: run bridge/tool/catalog/schema unit tests in `tests/unit/`.
+- `src/main/java/com/xebyte/core/*Service.java`: run offline Java tests and the relevant integration subset when live Ghidra is available.
+- `src/main/java/com/xebyte/headless/*`: run offline Java tests plus headless/deploy-related setup tests.
+- `ghidra-mcp-setup.ps1`: run `.\tests\pester\Run-Tests.ps1 -CI`.
+- `tools/setup/*`, `pom.xml`, or `build.gradle`: run setup CLI, Ghidra setup, Gradle task, version bump, and project consistency unit tests.
+- User-facing behavior: update `CHANGELOG.md`.
 
 ## Gotchas
 
-- Ghidra overwrites `FrontEndTool.xml` on exit — deploy must patch AFTER Ghidra exits
-- Shared server renames not persisted by `save_program` — must checkin to persist
-- Max ~5 shared server programs open at once — opening 20+ crashes Ghidra
-- Plate comment `\n` creates literal text, not newlines — use actual multi-line text
+- `tests/endpoints.json` is the authoritative repo snapshot; runtime truth comes from `/mcp/schema`.
+- POST endpoints with a `program` parameter expect it in the query string unless existing schema says otherwise.
+- Script endpoints are disabled unless `GHIDRA_MCP_ALLOW_SCRIPTS=1`.
+- Headless non-loopback binds should use `GHIDRA_MCP_AUTH_TOKEN`.
+- Deploy/live benchmark tiers can mutate the active Ghidra project; read `docs/TESTING.md` before running them.
+- Avoid committing generated state such as `target/`, `build/`, `.gradle/`, `logs/`, `fun-doc/state.json`, `fun-doc/inventory.json`, and `fun-doc/provider_pauses.json`.
+
+## References
+
+- Endpoint catalog: `tests/endpoints.json`
+- Testing and release regression: `docs/TESTING.md`
+- Tool usage guide: `docs/prompts/TOOL_USAGE_GUIDE.md`
+- Project structure: `docs/PROJECT_STRUCTURE.md`
+- Naming conventions: `docs/NAMING_CONVENTIONS.md`
+- Release checklist: `docs/releases/RELEASE_CHECKLIST.md`

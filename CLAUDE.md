@@ -40,25 +40,9 @@ Use this file for architecture, conventions, and implementation guidance; use th
 
 ## Build & Deploy
 
-Two backends are supported. Maven is the default; Gradle is the new primary path. Switch with `TOOLS_SETUP_BACKEND=gradle`.
+The supported facade is `python -m tools.setup`. It uses Maven by default, matching the README, VS Code tasks, and documented deploy flow. Gradle support exists as a secondary/manual migration path; switch with `TOOLS_SETUP_BACKEND=gradle` only when intentionally validating that path.
 
-**Gradle (set `TOOLS_SETUP_BACKEND=gradle` or invoke directly):**
-
-```text
-# Direct Gradle invocation — no tools.setup required
-./gradlew buildExtension -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
-./gradlew preflight      -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
-./gradlew deploy         -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
-./gradlew startGhidra    -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
-
-# Via tools.setup facade (same commands, Gradle backend)
-$env:TOOLS_SETUP_BACKEND = "gradle"
-python -m tools.setup build
-python -m tools.setup preflight --ghidra-path F:\ghidra_12.0.4_PUBLIC
-python -m tools.setup deploy    --ghidra-path F:\ghidra_12.0.4_PUBLIC
-```
-
-**Maven (default — existing tooling unchanged):**
+**Maven/default workflow:**
 
 ```text
 python -m tools.setup build
@@ -67,11 +51,25 @@ python -m tools.setup ensure-prereqs --ghidra-path F:\ghidra_12.0.4_PUBLIC
 python -m tools.setup deploy         --ghidra-path F:\ghidra_12.0.4_PUBLIC
 ```
 
-- Maven: `C:\Users\benam\tools\apache-maven-3.9.6\bin\mvn.cmd`
 - Ghidra install: `F:\ghidra_12.0.4_PUBLIC`
-- `tools.setup` delegates to Maven by default; set `TOOLS_SETUP_BACKEND=gradle` to route the same commands to Gradle
 - Deploy handles: build, extension install, FrontEndTool.xml patching, Ghidra restart
 - Migration plan: `docs/project-management/GRADLE_MIGRATION_CHECKLIST.md`
+
+**Gradle migration validation:**
+
+```text
+# Direct Gradle invocation
+./gradlew buildExtension -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
+./gradlew preflight      -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
+./gradlew deploy         -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
+./gradlew startGhidra    -PGHIDRA_INSTALL_DIR=F:\ghidra_12.0.4_PUBLIC
+
+# Via tools.setup facade using Gradle backend
+$env:TOOLS_SETUP_BACKEND = "gradle"
+python -m tools.setup build
+python -m tools.setup preflight --ghidra-path F:\ghidra_12.0.4_PUBLIC
+python -m tools.setup deploy    --ghidra-path F:\ghidra_12.0.4_PUBLIC
+```
 
 ## Releases
 
